@@ -3,7 +3,6 @@ from __future__ import annotations
 import socket
 import struct
 import time
-import errno
 from contextlib import contextmanager
 from typing import Iterable, Mapping, Optional, Sequence, Tuple, Union
 
@@ -12,6 +11,10 @@ from .pins import PinObject
 
 
 PortData = BoardData
+
+
+class BDACConnectionError(OSError):
+    """Raised when B_DAC cannot send/receive data after exhausting retries."""
 
 
 class SocketInstrument:
@@ -25,6 +28,7 @@ class SocketInstrument:
         self.serial_port = kwargs.get("serial_port")
         self.transport = kwargs.get("transport")
         self.baud_rate = int(kwargs.get("baud_rate", 115200))
+        self.connect_timeout_s = float(kwargs.get("connect_timeout_s", 0.5))
         self.instr = None
         self.connected = False
 
@@ -53,7 +57,7 @@ class SocketInstrument:
     def reconnect(self) -> None:
         self.close()
         if self.transport == "socket":
-            self.instr = socket.create_connection((str(self.ip_address), int(self.port)), timeout=2.0)
+            self.instr = socket.create_connection((str(self.ip_address), int(self.port)), timeout=self.connect_timeout_s)
             self.instr.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.instr.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
@@ -207,18 +211,16 @@ class B_DAC(PortInstrument, SocketInstrument):
         self.auto_send_commands = bool(kwargs.get("auto_send_commands", True))
         self.expect_ack = bool(kwargs.get("expect_ack", False))
         self.post_send_delay_ms = float(kwargs.get("post_send_delay_ms", 5.0))
-        self.reply_timeout = float(kwargs.get("reply_timeout", 2.0))
+        self.reply_timeout = float(kwargs.get("reply_timeout", 0.3))
         self.tcp_user_timeout_ms = int(kwargs.get("tcp_user_timeout_ms", 300))
         self.verify_connection_before_send = bool(kwargs.get("verify_connection_before_send", True))
         self.auto_reconnect_on_send = bool(kwargs.get("auto_reconnect_on_send", True))
-        self.reconnect_attempts = int(kwargs.get("reconnect_attempts", 20))
-        self.reconnect_backoff_ms = float(kwargs.get("reconnect_backoff_ms", 300.0))
-        self.reconnect_backoff_factor = float(kwargs.get("reconnect_backoff_factor", 1.35))
-        self.reconnect_max_backoff_ms = float(kwargs.get("reconnect_max_backoff_ms", 2000.0))
-        self.startup_grace_ms = float(kwargs.get("startup_grace_ms", 2500.0))
-        self.startup_error_grace_once = bool(kwargs.get("startup_error_grace_once", True))
-        self.send_retries_on_connection_error = int(kwargs.get("send_retries_on_connection_error", 3))
-        self.send_retry_backoff_ms = float(kwargs.get("send_retry_backoff_ms", 200.0))
+        # Total wall-clock time allowed for (re)connect + send retries before send() raises.
+        self.connect_retry_budget_s = float(kwargs.get("connect_retry_budget_s", 2.0))
+        self.reconnect_backoff_ms = float(kwargs.get("reconnect_backoff_ms", 100.0))
+        self.reconnect_backoff_factor = float(kwargs.get("reconnect_backoff_factor", 1.5))
+        self.reconnect_max_backoff_ms = float(kwargs.get("reconnect_max_backoff_ms", 500.0))
+        self.send_retry_backoff_ms = float(kwargs.get("send_retry_backoff_ms", 100.0))
         self._last_reconnect_error = ""
         self._batch_depth = 0
         self.instr = None
@@ -278,10 +280,10 @@ class B_DAC(PortInstrument, SocketInstrument):
         if self._should_send_now(send_immediately):
             self.send()
 
-    def _ensure_connection_for_send(self) -> bool:
+    def _ensure_connection_for_send(self, deadline: float) -> bool:
         if self.instr is None:
             if self.auto_reconnect_on_send:
-                return self._reconnect_with_retries()
+                return self._reconnect_with_retries(deadline)
             return False
 
         if not self.verify_connection_before_send:
@@ -291,62 +293,39 @@ class B_DAC(PortInstrument, SocketInstrument):
             return True
 
         if self.auto_reconnect_on_send:
-            return self._reconnect_with_retries()
+            return self._reconnect_with_retries(deadline)
 
         return False
 
-    def _reconnect_with_retries(self) -> bool:
-        attempts = max(1, int(self.reconnect_attempts))
+    def _reconnect_with_retries(self, deadline: Optional[float] = None) -> bool:
+        if deadline is None:
+            deadline = time.monotonic() + self.connect_retry_budget_s
+
         base_delay_s = max(0.0, float(self.reconnect_backoff_ms) / 1000.0)
         backoff_factor = max(1.0, float(self.reconnect_backoff_factor))
         max_delay_s = max(base_delay_s, float(self.reconnect_max_backoff_ms) / 1000.0)
         self._last_reconnect_error = ""
-        startup_grace_used = False
 
-        for attempt in range(attempts):
+        attempt = 0
+        while True:
             try:
                 self.reconnect()
                 if self.is_connected(probe=True):
                     return True
             except Exception as exc:
-                # Keep retrying until attempts are exhausted.
                 self._last_reconnect_error = str(exc)
 
-                # W5500/TCP tasks can need extra warm-up after link flap.
-                if (
-                    self.startup_error_grace_once
-                    and not startup_grace_used
-                    and self._is_startup_connect_error(exc)
-                ):
-                    grace_s = max(0.0, float(self.startup_grace_ms) / 1000.0)
-                    if grace_s > 0:
-                        time.sleep(grace_s)
-                    startup_grace_used = True
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                return False
 
-            # No need to sleep after the final attempt.
-            if attempt + 1 < attempts and base_delay_s > 0:
-                delay_s = min(max_delay_s, base_delay_s * (backoff_factor ** attempt))
+            delay_s = min(max_delay_s, base_delay_s * (backoff_factor ** attempt), remaining_s)
+            if delay_s > 0:
                 time.sleep(delay_s)
+            attempt += 1
 
-        return False
-
-    def _is_startup_connect_error(self, exc: Exception) -> bool:
-        if isinstance(exc, ConnectionRefusedError):
-            return True
-
-        if isinstance(exc, TimeoutError):
-            return True
-
-        if isinstance(exc, OSError):
-            err_no = getattr(exc, "errno", None)
-            if err_no in (errno.ECONNREFUSED, errno.ETIMEDOUT, errno.EHOSTUNREACH, errno.ENETUNREACH):
-                return True
-
-        message = str(exc).lower()
-        if "connection refused" in message or "timed out" in message:
-            return True
-
-        return False
+            if time.monotonic() >= deadline:
+                return False
 
     def _read_ack_if_needed(self) -> bytes:
         if not self.expect_ack:
@@ -362,11 +341,10 @@ class B_DAC(PortInstrument, SocketInstrument):
             if hasattr(self.instr, "read"):
                 return self.instr.read(2)
             return b""
-        except socket.timeout:
-            print("No ACK received from B_DAC within " + str(self.reply_timeout) + "s")
-            return b""
-        except Exception:
-            return b""
+        except socket.timeout as exc:
+            raise BDACConnectionError(
+                "No ACK received from B_DAC within " + str(self.reply_timeout) + "s"
+            ) from exc
 
     def _send_payload_once(self, payload: bytes) -> bytes:
         self._write_raw(payload)
@@ -391,39 +369,37 @@ class B_DAC(PortInstrument, SocketInstrument):
             self._buffer.clear()
             return b""
 
-        response = b""
-        total_send_attempts = max(1, int(self.send_retries_on_connection_error) + 1)
+        deadline = time.monotonic() + self.connect_retry_budget_s
         send_backoff_s = max(0.0, float(self.send_retry_backoff_ms) / 1000.0)
         last_send_error = ""
 
         try:
-            for attempt in range(total_send_attempts):
-                if not self._ensure_connection_for_send():
-                    if attempt + 1 < total_send_attempts and send_backoff_s > 0:
-                        time.sleep(send_backoff_s)
-                    continue
+            while True:
+                if not self._ensure_connection_for_send(deadline):
+                    break
 
                 try:
-                    response = self._send_payload_once(payload)
-                    return response
+                    return self._send_payload_once(payload)
                 except (BrokenPipeError, ConnectionResetError, OSError) as exc:
                     last_send_error = str(exc)
                     self._discard_connection_handle()
 
-                if attempt + 1 < total_send_attempts and send_backoff_s > 0:
-                    time.sleep(send_backoff_s)
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0:
+                    break
+                time.sleep(min(send_backoff_s, remaining_s))
 
             if self._last_reconnect_error:
-                print(
+                message = (
                     "B_DAC is not connected ("
                     + self._last_reconnect_error
                     + "). Set serial_port (or serial), or ip_address/port, and reconnect before sending commands."
                 )
             elif last_send_error:
-                print("Connection error: " + last_send_error)
+                message = "Connection error: " + last_send_error
             else:
-                print("B_DAC is not connected. Set serial_port (or serial), or ip_address/port, and reconnect before sending commands.")
-            return b""
+                message = "B_DAC is not connected. Set serial_port (or serial), or ip_address/port, and reconnect before sending commands."
+            raise BDACConnectionError(message)
         finally:
             self._buffer.clear()
 
