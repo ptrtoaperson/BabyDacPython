@@ -109,6 +109,22 @@ k.dac_01.soft_sequence(500, src)
 k.clear_state()
 ```
 
+### Set voltages on multiple channels
+
+Pass an iterable of `(channel, voltage)` pairs. Channels can be channel
+attributes such as `k.dac_01` or integer channel IDs. All updates are queued
+before the send policy is applied once:
+
+```python
+k.set_voltages([
+    (k.dac_01, 2.0),
+    (k.dac_03, 5.0),
+])
+```
+
+To queue the updates without sending yet, pass `send_immediately=False` and
+call `k.send()` when ready.
+
 ### Batch multiple commands for simultaneous execution:
 
 ```python

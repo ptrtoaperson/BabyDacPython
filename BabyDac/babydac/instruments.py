@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from typing import Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 from .config import BoardData, InstrumentData
-from .pins import PinObject
+from .pins import B_DAC_Channel, PinObject
 
 
 PortData = BoardData
@@ -498,6 +498,26 @@ class B_DAC(PortInstrument, SocketInstrument):
 
     def set_voltage(self, channel: int, voltage: float, send_immediately: Optional[bool] = None) -> None:
         self._append_voltage_code(channel, self.code_from_voltage(float(voltage)))
+        self._send_if_needed(send_immediately)
+
+    def set_voltages(
+        self,
+        assignments: Iterable[Tuple[Union[int, B_DAC_Channel], float]],
+        send_immediately: Optional[bool] = None,
+    ) -> None:
+        updates = [
+            (int(getattr(channel, "port", channel)), self.code_from_voltage(float(voltage)))
+            for channel, voltage in assignments
+        ]
+
+        original_buffer_length = len(self._buffer)
+        try:
+            for channel, code_value in updates:
+                self._append_voltage_code(channel, code_value)
+        except Exception:
+            del self._buffer[original_buffer_length:]
+            raise
+
         self._send_if_needed(send_immediately)
 
     def start_pwm(
